@@ -26,6 +26,9 @@ import logging
 import os.path
 from typing import Any, Optional, Union
 
+import concurrent.futures
+from tqdm import tqdm
+
 import apache_beam as beam
 import dask
 import fsspec
@@ -564,8 +567,6 @@ def _evaluate_with_parallel_single(
     n_workers: int,
 ) -> None:
   """Evaluate metrics for a single eval config using parallel processing."""
-  import concurrent.futures
-  from tqdm import tqdm
   
   # Open datasets (with dask for lazy loading)
   forecast, truth, climatology = open_forecast_and_truth_datasets(

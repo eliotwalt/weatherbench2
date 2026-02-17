@@ -35,7 +35,7 @@ export NUMEXPR_NUM_THREADS=1
 # ================================
 
 python scripts/evaluate.py \
-    --forecast_path=gs://weatherbench2/datasets/ifs_ens/2018-2022-240x121_equiangular_with_poles_conservative.zarr \
+    --forecast_path=gs://weatherbench2/datasets/hres/2016-2022-0012-240x121_equiangular_with_poles_conservative.zarr \
     --obs_path=gs://weatherbench2/datasets/era5/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr \
     --climatology_path=gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_240x121_equiangular_with_poles_conservative.zarr \
     --output_dir=./result \

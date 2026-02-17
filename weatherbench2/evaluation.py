@@ -530,6 +530,7 @@ def _metric_and_region_loop_parallel(
         )
         delayed_results.append(delayed_result)
         task_names.append(f'{metric_name}/{region_name}')
+        logging.info(f'scheduled metric: {metric_name}, region: {region_name}')
     else:
       delayed_result = dask.delayed(_compute_single_metric_region)(
           forecast=forecast,
@@ -542,6 +543,7 @@ def _metric_and_region_loop_parallel(
       )
       delayed_results.append(delayed_result)
       task_names.append(metric_name)
+      logging.info(f'scheduled metric: {metric_name}')
   
   logging.info(f'Processing {len(delayed_results)} (metric, region) combinations with {n_workers} workers')
   logging.info(f'Tasks: {task_names}')
@@ -666,7 +668,6 @@ def evaluate_parallel(
   for eval_name, eval_config in eval_configs.items():
     _evaluate_all_metrics(eval_name, eval_config, data_config, skipna=skipna, parallel=True, n_workers=n_workers)
   
-
 
 @dataclasses.dataclass
 class _SaveOutputs(beam.PTransform):

@@ -46,7 +46,7 @@ python scripts/evaluate.py \
 	--output_file_prefix=ens_vs_era5 \
 	--output_dir=./result \
 	--use_beam=False \
-	--use_dask=True \
-	--dask_n_workers=$SLURM_CPUS_PER_TASK \
-	--dask_chunks=init_time=1,lead_time=12 \
+	--use_parallel=True \
+	--num_threads=$SLURM_CPUS_PER_TASK \
+	--input_chunks=init_time=1,lead_time=12 \
 # skipna: True with hres_t0?

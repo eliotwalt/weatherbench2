@@ -26,10 +26,8 @@ import logging
 import os.path
 from typing import Any, Optional, Union
 
-import dask
-from dask.distributed import Client, LocalCluster, progress
-
 import apache_beam as beam
+import dask
 import fsspec
 import numpy as np
 from weatherbench2 import config
@@ -67,8 +65,8 @@ def _ensure_aligned_grid(
 
 def _ensure_nonempty(dataset: xr.Dataset, message: str = '') -> None:
   """Make sure dataset is nonempty."""
-  if not min(dataset.dims.values()):
-    raise ValueError(f'`dataset` was empty: {dataset.dims=}.  {message}')
+  if not min(dataset.sizes.values()):
+    raise ValueError(f'`dataset` was empty: {dataset.sizes=}.  {message}')
 
 
 def _decode_pressure_level_suffixes(forecast: xr.Dataset) -> xr.Dataset:
@@ -518,17 +516,20 @@ def evaluate_in_memory(
   """
   for eval_name, eval_config in eval_configs.items():
     _evaluate_all_metrics(eval_name, eval_config, data_config, skipna=skipna)
-    
-def evaluate_with_dask(
+
+
+def evaluate_parallel(
     data_config: config.Data,
     eval_configs: dict[str, config.Eval],
     skipna: bool = False,
     n_workers: Optional[int] = None,
-    threads_per_worker: int = 1,
-    memory_limit: str = 'auto',
     chunks: Optional[dict[str, int]] = None,
 ) -> None:
-  """Run evaluation using Dask distributed computing.
+  """Run evaluation using parallel processing with ThreadPoolExecutor.
+
+  Uses threads for parallel I/O-bound zarr reads and metric computation
+  across time chunks. Each thread uses the synchronous dask scheduler
+  to avoid nested scheduler conflicts.
 
   Will save a separate results NetCDF file for each config.Eval.
 
@@ -536,58 +537,46 @@ def evaluate_with_dask(
     data_config: config.Data instance.
     eval_configs: Dictionary of config.Eval instances.
     skipna: Whether to skip NaN values in both forecasts and observations.
-    n_workers: Number of Dask workers. Defaults to number of CPUs.
-    threads_per_worker: Threads per worker. Use 1 for CPU-bound work.
-    memory_limit: Memory limit per worker (e.g., '4GB', 'auto').
+    n_workers: Number of parallel workers. Defaults to number of CPUs.
     chunks: Chunk sizes for parallelization, e.g. {'init_time': 10}.
       If None, defaults to chunking along init_time/time with size 1.
   """
+  import os
   
   if n_workers is None:
-    import os
     n_workers = os.cpu_count() or 4
+  
+  logging.info(f'Using {n_workers} workers for parallel evaluation')
 
-  cluster = LocalCluster(
-      n_workers=n_workers,
-      threads_per_worker=threads_per_worker,
-      memory_limit=memory_limit,
-  )
-  client = Client(cluster)
-  logging.info(f'Dask dashboard: {client.dashboard_link}')
-
-  try:
-    for eval_name, eval_config in eval_configs.items():
-      logging.info(f'Evaluating {eval_name}')
-      _evaluate_with_dask_single(
-          eval_name, eval_config, data_config, skipna, chunks, client
-      )
-  finally:
-    client.close()
-    cluster.close()
+  for eval_name, eval_config in eval_configs.items():
+    logging.info(f'Evaluating {eval_name}')
+    _evaluate_with_parallel_single(
+        eval_name, eval_config, data_config, skipna, chunks, n_workers
+    )
 
 
-def _evaluate_with_dask_single(
+def _evaluate_with_parallel_single(
     eval_name: str,
     eval_config: config.Eval,
     data_config: config.Data,
     skipna: bool,
     chunks: Optional[dict[str, int]],
-    client,
+    n_workers: int,
 ) -> None:
-  """Evaluate metrics for a single eval config using Dask."""
+  """Evaluate metrics for a single eval config using parallel processing."""
+  import concurrent.futures
+  from tqdm import tqdm
   
+  # Open datasets (with dask for lazy loading)
   forecast, truth, climatology = open_forecast_and_truth_datasets(
       data_config, eval_config, use_dask=True
   )
 
   time_dim = 'init_time' if data_config.by_init else 'time'
   
-  # Default chunking: 1 along time dimension for embarrassingly parallel ops
+  # Default chunking
   if chunks is None:
     chunks = {time_dim: 1}
-  
-  # Rechunk forecast for parallel processing
-  forecast = forecast.chunk(chunks)
   
   # Handle special forecast types
   if eval_config.evaluate_climatology:
@@ -595,7 +584,7 @@ def _evaluate_with_dask_single(
     forecast = climatology[list(forecast.keys())].sel(
         dayofyear=forecast[valid_time_dim].dt.dayofyear,
         hour=forecast[valid_time_dim].dt.hour,
-    ).chunk(chunks)
+    )
     
   if eval_config.evaluate_probabilistic_climatology:
     probabilistic_climatology = utils.make_probabilistic_climatology(
@@ -608,11 +597,11 @@ def _evaluate_with_dask_single(
     forecast = probabilistic_climatology[list(forecast.keys())].sel(
         dayofyear=forecast[valid_time_dim].dt.dayofyear,
         hour=forecast[valid_time_dim].dt.hour,
-    ).chunk(chunks)
+    )
 
   if eval_config.evaluate_persistence:
-    forecast = create_persistence_forecast(forecast, truth).chunk(chunks)
-
+    forecast = create_persistence_forecast(forecast, truth)
+  
   # Get time coordinate values for iteration
   time_coords = forecast[time_dim].values
   chunk_size = chunks.get(time_dim, 1)
@@ -620,32 +609,47 @@ def _evaluate_with_dask_single(
       time_coords[i:i + chunk_size] 
       for i in range(0, len(time_coords), chunk_size)
   ]
-
-  # Create delayed tasks for each time chunk
-  @dask.delayed
-  def process_chunk(time_slice):
-    forecast_chunk = forecast.sel({time_dim: time_slice}).compute()
-    if data_config.by_init:
-      truth_chunk = truth.sel(time=forecast_chunk.valid_time).compute()
-    else:
-      truth_chunk = truth.sel(time=time_slice).compute()
-    
-    return _metric_and_region_loop(
-        forecast_chunk,
-        truth_chunk,
-        eval_config,
-        skipna=skipna,
-        compute_chunk=True,
-    )
-
-  # Submit all chunks as delayed tasks
-  delayed_results = [process_chunk(tc) for tc in time_chunks]
   
-  # Compute all chunks in parallel with progress bar
-  logging.info(f'Processing {len(delayed_results)} chunks with Dask')
-  futures = client.compute(delayed_results)
-  progress(futures)
-  results = client.gather(futures)
+  logging.info(f'Processing {len(time_chunks)} chunks with {n_workers} workers')
+  
+  def process_chunk(time_slice):
+    """Process a single time chunk using synchronous dask scheduler."""
+    with dask.config.set(scheduler='synchronous'):
+      forecast_chunk = forecast.sel({time_dim: time_slice}).compute()
+      
+      if data_config.by_init:
+        truth_chunk = truth.sel(time=forecast_chunk.valid_time).compute()
+      else:
+        truth_chunk = truth.sel(time=time_slice).compute()
+      
+      return _metric_and_region_loop(
+          forecast_chunk,
+          truth_chunk,
+          eval_config,
+          skipna=skipna,
+          compute_chunk=True,
+      )
+  
+  # Use ThreadPoolExecutor (shares memory, avoids pickling issues)
+  results = []
+  with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+    futures = {executor.submit(process_chunk, tc): i for i, tc in enumerate(time_chunks)}
+    
+    for future in tqdm(
+        concurrent.futures.as_completed(futures),
+        total=len(futures),
+        desc=f'Evaluating {eval_name}',
+    ):
+      try:
+        result = future.result()
+        results.append((futures[future], result))
+      except Exception as e:
+        logging.error(f'Chunk processing failed: {e}')
+        raise
+  
+  # Sort results by original order
+  results.sort(key=lambda x: x[0])
+  results = [r[1] for r in results]
 
   # Combine results along time dimension and compute temporal mean
   combined = xr.concat(results, dim=time_dim)

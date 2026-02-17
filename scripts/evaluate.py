@@ -274,30 +274,10 @@ SHUFFLE_BEFORE_TEMPORAL_MEAN = flags.DEFINE_bool(
         ' input data, such as when aggregating over space or a large ensemble.'
     ),
 )
-USE_DASK = flags.DEFINE_bool(
-    'use_dask',
+USE_PARALLEL = flags.DEFINE_bool(
+    'use_parallel',
     False,
-    'Run evaluation with Dask. If False, run in memory.',
-)
-DASK_N_WORKERS = flags.DEFINE_integer(
-    'dask_n_workers',
-    None,
-    help='Number of Dask workers. If None, defaults to number of cores.',
-)
-DASK_THREADS_PER_WORKER = flags.DEFINE_integer(
-    'dask_threads_per_worker',
-    1,
-    help='Number of threads per Dask worker. If None, defaults to 1.',
-)
-DASK_CHUNKS = flag_utils.DEFINE_chunks(
-    'dask_chunks',
-    'init_time=1,lead_time=12',
-    help=(
-        'Chunk sizes to use when loading data with Dask. By default, omitted'
-        ' dimension names are loaded in one chunk. Metrics should be'
-        ' embarrassingly parallel across chunked dimensions. In particular,'
-        ' output variables should contain these dimensions.'
-    ),
+    'Run evaluation in parallel in memory.',
 )
 
 def _wind_vector_error(err_type: str):
@@ -719,14 +699,13 @@ def main(argv: list[str]) -> None:
         argv=argv,
     )
   else:
-    if USE_DASK.value:
-      evaluation.evaluate_with_dask(
+    if USE_PARALLEL.value:
+      evaluation.evaluate_parallel(
         data_config=data_config,
         eval_configs=eval_configs,
         skipna=SKIPNA.value,
-        n_workers=DASK_N_WORKERS.value,
-        threads_per_worker=DASK_THREADS_PER_WORKER.value,
-        chunks=DASK_CHUNKS.value,
+        n_workers=NUM_THREADS.value,
+        chunks=INPUT_CHUNKS.value,
       )
     else:
       evaluation.evaluate_in_memory(

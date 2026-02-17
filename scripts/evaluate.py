@@ -705,7 +705,6 @@ def main(argv: list[str]) -> None:
         eval_configs=eval_configs,
         skipna=SKIPNA.value,
         n_workers=NUM_THREADS.value,
-        chunks=INPUT_CHUNKS.value,
       )
     else:
       evaluation.evaluate_in_memory(

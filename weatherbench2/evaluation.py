@@ -27,11 +27,9 @@ import logging
 import os.path
 from typing import Any, Optional, Union
 
-import concurrent.futures
-from tqdm import tqdm
-
 import apache_beam as beam
 import dask
+import dask.diagnostics
 import fsspec
 import numpy as np
 from weatherbench2 import config
@@ -443,6 +441,35 @@ def _metric_and_region_loop(
   return results
 
 
+def _compute_single_metric_region(
+    forecast: xr.Dataset,
+    truth: xr.Dataset,
+    metric_name: str,
+    eval_fn,
+    region_name: Optional[str],
+    region,
+    skipna: bool,
+) -> xr.Dataset:
+  """Compute a single (metric, region) combination.
+  
+  Defined at module level for dask.delayed pickling compatibility.
+  """
+  metric_dim = xr.DataArray([metric_name], coords={'metric': [metric_name]})
+  
+  if region is not None:
+    region_dim = xr.DataArray([region_name], coords={'region': [region_name]})
+    result = eval_fn(
+        forecast=forecast, truth=truth, region=region, skipna=skipna
+    )
+    result = result.expand_dims({'metric': metric_dim, 'region': region_dim})
+  else:
+    result = eval_fn(
+        forecast=forecast, truth=truth, skipna=skipna
+    ).expand_dims({'metric': metric_dim})
+  
+  return result
+
+
 def _metric_and_region_loop_parallel(
     forecast: xr.Dataset,
     truth: xr.Dataset,
@@ -451,18 +478,26 @@ def _metric_and_region_loop_parallel(
     compute_chunk: bool = False,
     n_workers: Optional[int] = None,
 ) -> xr.Dataset:
-  """Parallel version of _metric_and_region_loop.
+  """Parallel version of _metric_and_region_loop using Dask scheduling.
   
-  Parallelizes computation across (metric, region) combinations using ThreadPoolExecutor.
+  Uses dask.delayed to build a task graph and compute with controlled parallelism.
+  Dask manages memory by scheduling tasks intelligently rather than loading all data
+  simultaneously.
+  
+  Args:
+    forecast: Forecast dataset (can be dask-backed).
+    truth: Truth/observation dataset (can be dask-backed).
+    eval_config: Evaluation configuration.
+    skipna: Whether to skip NaN values.
+    compute_chunk: Whether to use compute_chunk instead of compute for metrics.
+    n_workers: Number of parallel workers for dask scheduler.
   """
-  
   if n_workers is None:
     n_workers = os.cpu_count() or 4
   
-  logging.info('Starting _metric_and_region_loop_parallel')
+  logging.info('Starting _metric_and_region_loop_parallel (dask)')
   logging.info(
-      f'{len(forecast)} variables, {forecast.sizes=}, {truth.sizes=}, '
-      f'({forecast.nbytes + truth.nbytes} bytes)'
+      f'{len(forecast)} variables, {forecast.sizes=}, {truth.sizes=}'
   )
   
   # Compute derived variables first (not parallelized as they modify datasets)
@@ -471,8 +506,10 @@ def _metric_and_region_loop_parallel(
     forecast[name] = dv.compute(forecast)
     truth[name] = dv.compute(truth)
   
-  # Build list of (metric_name, metric, region_name, region) tasks
-  tasks = []
+  # Build list of delayed tasks for each (metric, region) combination
+  delayed_results = []
+  task_names = []  # For logging
+  
   for metric_name, metric in eval_config.metrics.items():
     if compute_chunk or not eval_config.temporal_mean:
       eval_fn = metric.compute_chunk
@@ -481,48 +518,40 @@ def _metric_and_region_loop_parallel(
     
     if eval_config.regions is not None:
       for region_name, region in eval_config.regions.items():
-        tasks.append((metric_name, eval_fn, region_name, region))
+        # Create delayed task
+        delayed_result = dask.delayed(_compute_single_metric_region)(
+            forecast=forecast,
+            truth=truth,
+            metric_name=metric_name,
+            eval_fn=eval_fn,
+            region_name=region_name,
+            region=region,
+            skipna=skipna,
+        )
+        delayed_results.append(delayed_result)
+        task_names.append(f'{metric_name}/{region_name}')
     else:
-      tasks.append((metric_name, eval_fn, None, None))
-  
-  def compute_single_task(task):
-    """Compute a single (metric, region) combination."""
-    metric_name, eval_fn, region_name, region = task
-    metric_dim = xr.DataArray([metric_name], coords={'metric': [metric_name]})
-    
-    if region is not None:
-      region_dim = xr.DataArray([region_name], coords={'region': [region_name]})
-      result = eval_fn(
-          forecast=forecast, truth=truth, region=region, skipna=skipna
+      delayed_result = dask.delayed(_compute_single_metric_region)(
+          forecast=forecast,
+          truth=truth,
+          metric_name=metric_name,
+          eval_fn=eval_fn,
+          region_name=None,
+          region=None,
+          skipna=skipna,
       )
-      result = result.expand_dims({'metric': metric_dim, 'region': region_dim})
-    else:
-      result = eval_fn(
-          forecast=forecast, truth=truth, skipna=skipna
-      ).expand_dims({'metric': metric_dim})
-    
-    return result
+      delayed_results.append(delayed_result)
+      task_names.append(metric_name)
   
-  logging.info(f'Processing {len(tasks)} (metric, region) combinations with {n_workers} workers')
+  logging.info(f'Processing {len(delayed_results)} (metric, region) combinations with {n_workers} workers')
+  logging.info(f'Tasks: {task_names}')
   
-  # Execute tasks in parallel
-  results = []
-  with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-    futures = {executor.submit(compute_single_task, task): task for task in tasks}
-    
-    for future in tqdm(
-        concurrent.futures.as_completed(futures),
-        total=len(futures),
-        desc='Computing metrics',
-    ):
-      task = futures[future]
-      try:
-        result = future.result()
-        results.append(result)
-      except Exception as e:
-        metric_name, _, region_name, _ = task
-        logging.error(f'Failed computing {metric_name}/{region_name}: {e}')
-        raise
+  # Compute all delayed results using dask's threaded scheduler
+  # This manages memory by not loading all data at once
+  with dask.config.set(scheduler='threads', num_workers=n_workers):
+    # Use ProgressBar context for visibility
+    with dask.diagnostics.ProgressBar():
+      results = dask.compute(*delayed_results)
   
   # Merge all results
   merged = xr.merge(results)
@@ -565,6 +594,8 @@ def _evaluate_all_metrics(
 
   if data_config.by_init:
     truth = truth.sel(time=forecast.valid_time)
+    
+  logging.info(f"Computing {len(eval_config.metrics)} {eval_name} metrics")
 
   if parallel:
     results = _metric_and_region_loop_parallel(
@@ -619,18 +650,18 @@ def evaluate_parallel(
     eval_configs: dict[str, config.Eval],
     skipna: bool = False,
     n_workers: Optional[int] = None,
-    chunks: Optional[dict[str, int]] = None,  # Not used currently, for API compatibility
 ) -> None:
-  """Run evaluation in parallel in memory.
+  """Run evaluation in parallel using Dask scheduling.
   
-  Use concurrent.futures to parallelize the evaluation of different metrics and regions.
+  Uses dask.delayed to build a task graph for (metric, region) combinations,
+  then computes with controlled parallelism. Dask manages memory by scheduling
+  tasks intelligently rather than loading all data simultaneously.
   
   Args:
     data_config: config.Data instance.
     eval_configs: Dictionary of config.Eval instances.
     skipna: Whether to skip NaN values in both forecasts and observations.
-    n_workers: Number of parallel workers. Defaults to number of CPUs.
-    chunks: Currently unused, kept for API compatibility.
+    n_workers: Number of parallel workers for dask scheduler. Defaults to CPU count.
   """
   for eval_name, eval_config in eval_configs.items():
     _evaluate_all_metrics(eval_name, eval_config, data_config, skipna=skipna, parallel=True, n_workers=n_workers)

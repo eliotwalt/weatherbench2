@@ -40,6 +40,6 @@ python scripts/evaluate.py \
     --climatology_path=gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_240x121_equiangular_with_poles_conservative.zarr \
     --output_dir=./result \
     --input_chunks=time=1,lead_time=1 \
-    --eval_configs=deterministic
-    # --use_beam=True \
-    # --runner=DirectRunner \
+    --eval_configs=deterministic \
+    --use_beam=True \
+    --runner=DirectRunner

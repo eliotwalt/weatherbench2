@@ -3,7 +3,7 @@
 # ================================
 # SBATCH CONFIGURATION
 # ================================
-#SBATCH --job-name=wbx
+#SBATCH --job-name=wb2
 #SBATCH --partition=fat_genoa
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -42,4 +42,7 @@ python scripts/evaluate.py \
     --input_chunks=init_time=1,lead_time=1 \
     --eval_configs=deterministic \
     --use_beam=True \
-    --runner=DirectRunner
+    --runner=DirectRunner \
+    -- \
+    --direct_running_mode=multi_threading \
+    --direct_num_workers=96

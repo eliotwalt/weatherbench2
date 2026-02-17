@@ -45,4 +45,4 @@ python scripts/evaluate.py \
     --runner=DirectRunner \
     -- \
     --direct_running_mode=multi_threading \
-    --direct_num_workers=96
+    --direct_num_threads=96

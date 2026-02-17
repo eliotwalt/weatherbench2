@@ -62,7 +62,7 @@ _DEFAULT_VARIABLES = [
     '2m_temperature',
     'mean_sea_level_pressure',
 ]
-_DEFAULT_DERIVED_VARIABLES = []
+_DEFAULT_DERIVED_VARIABLES = ['wind_speed']
 
 _DEFAULT_LEVELS = ['500', '700', '850']
 
@@ -193,7 +193,7 @@ AUX_VARIABLES = flags.DEFINE_list(
 )
 DERIVED_VARIABLES = flags.DEFINE_list(
     'derived_variables',
-    [],
+    _DEFAULT_DERIVED_VARIABLES,
     help=(
         'Comma delimited list of derived variables to dynamically compute'
         'during evaluation.'
@@ -343,6 +343,7 @@ def main(argv: list[str]) -> None:
 
   # Default regions
   predefined_regions = {
+      # ECMWF REGIONS
       'global': SliceRegion(),
       'tropics': SliceRegion(lat_slice=slice(-20, 20)),
       'extra-tropics': SliceRegion(
@@ -371,6 +372,26 @@ def main(argv: list[str]) -> None:
       ),
       'arctic': SliceRegion(lat_slice=slice(60, 90)),
       'antarctic': SliceRegion(lat_slice=slice(-90, -60)),
+      # ADDITIONAL REGIONS
+      'northern-africa': SliceRegion(
+            lat_slice=slice(5, 32.5), lon_slice=slice(-12.5, 37.5),
+      ),
+      'southern-africa': SliceRegion(
+            lat_slice=slice(-30, 5), lon_slice=slice(12.5, 37.5),
+      ),
+      'south-america': SliceRegion(
+          lat_slice=slice(-40, 5), lon_slice=slice(-75, -45)
+      ),
+      'west-asia': SliceRegion(
+          lat_slice=slice(15, 60), lon_slice=slice(42.5, 102.5)
+      ),
+      'south-east-asia': SliceRegion(
+          lat_slice=slice(-12.5, 25), lon_slice=slice(95, 125)
+      ),  
+      # CUSTOM REGIONS
+      'mediterranean': SliceRegion(
+          lat_slice=slice(25, 50), lon_slice=slice(-10, 40)
+      ),
   }
   try:
     if LSM_DATASET.value:

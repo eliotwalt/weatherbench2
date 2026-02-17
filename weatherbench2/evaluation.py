@@ -19,6 +19,7 @@ saving results for a given config file.
 """
 from __future__ import annotations
 
+import os
 from collections import abc
 import copy
 import dataclasses
@@ -442,11 +443,98 @@ def _metric_and_region_loop(
   return results
 
 
+def _metric_and_region_loop_parallel(
+    forecast: xr.Dataset,
+    truth: xr.Dataset,
+    eval_config: config.Eval,
+    skipna: bool,
+    compute_chunk: bool = False,
+    n_workers: Optional[int] = None,
+) -> xr.Dataset:
+  """Parallel version of _metric_and_region_loop.
+  
+  Parallelizes computation across (metric, region) combinations using ThreadPoolExecutor.
+  """
+  
+  if n_workers is None:
+    n_workers = os.cpu_count() or 4
+  
+  logging.info('Starting _metric_and_region_loop_parallel')
+  logging.info(
+      f'{len(forecast)} variables, {forecast.sizes=}, {truth.sizes=}, '
+      f'({forecast.nbytes + truth.nbytes} bytes)'
+  )
+  
+  # Compute derived variables first (not parallelized as they modify datasets)
+  for name, dv in eval_config.derived_variables.items():
+    logging.info(f'Computing derived_variable {name!r}: {dv}')
+    forecast[name] = dv.compute(forecast)
+    truth[name] = dv.compute(truth)
+  
+  # Build list of (metric_name, metric, region_name, region) tasks
+  tasks = []
+  for metric_name, metric in eval_config.metrics.items():
+    if compute_chunk or not eval_config.temporal_mean:
+      eval_fn = metric.compute_chunk
+    else:
+      eval_fn = metric.compute
+    
+    if eval_config.regions is not None:
+      for region_name, region in eval_config.regions.items():
+        tasks.append((metric_name, eval_fn, region_name, region))
+    else:
+      tasks.append((metric_name, eval_fn, None, None))
+  
+  def compute_single_task(task):
+    """Compute a single (metric, region) combination."""
+    metric_name, eval_fn, region_name, region = task
+    metric_dim = xr.DataArray([metric_name], coords={'metric': [metric_name]})
+    
+    if region is not None:
+      region_dim = xr.DataArray([region_name], coords={'region': [region_name]})
+      result = eval_fn(
+          forecast=forecast, truth=truth, region=region, skipna=skipna
+      )
+      result = result.expand_dims({'metric': metric_dim, 'region': region_dim})
+    else:
+      result = eval_fn(
+          forecast=forecast, truth=truth, skipna=skipna
+      ).expand_dims({'metric': metric_dim})
+    
+    return result
+  
+  logging.info(f'Processing {len(tasks)} (metric, region) combinations with {n_workers} workers')
+  
+  # Execute tasks in parallel
+  results = []
+  with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+    futures = {executor.submit(compute_single_task, task): task for task in tasks}
+    
+    for future in tqdm(
+        concurrent.futures.as_completed(futures),
+        total=len(futures),
+        desc='Computing metrics',
+    ):
+      task = futures[future]
+      try:
+        result = future.result()
+        results.append(result)
+      except Exception as e:
+        metric_name, _, region_name, _ = task
+        logging.error(f'Failed computing {metric_name}/{region_name}: {e}')
+        raise
+  
+  # Merge all results
+  merged = xr.merge(results)
+  return merged
+
 def _evaluate_all_metrics(
     eval_name: str,
     eval_config: config.Eval,
     data_config: config.Data,
     skipna: bool,
+    parallel: bool = False,
+    **parallel_kwargs: Any,
 ) -> None:
   """Evaluate a set of eval metrics in memory."""
   forecast, truth, climatology = open_forecast_and_truth_datasets(
@@ -478,7 +566,12 @@ def _evaluate_all_metrics(
   if data_config.by_init:
     truth = truth.sel(time=forecast.valid_time)
 
-  results = _metric_and_region_loop(forecast, truth, eval_config, skipna=skipna)
+  if parallel:
+    results = _metric_and_region_loop_parallel(
+        forecast, truth, eval_config, skipna=skipna, **parallel_kwargs
+    )
+  else:
+    results = _metric_and_region_loop(forecast, truth, eval_config, skipna=skipna)
 
   logging.info(f'Logging Evaluation complete:\n{results}')
 
@@ -519,149 +612,29 @@ def evaluate_in_memory(
   """
   for eval_name, eval_config in eval_configs.items():
     _evaluate_all_metrics(eval_name, eval_config, data_config, skipna=skipna)
-
-
+  
+  
 def evaluate_parallel(
     data_config: config.Data,
     eval_configs: dict[str, config.Eval],
     skipna: bool = False,
     n_workers: Optional[int] = None,
-    chunks: Optional[dict[str, int]] = None,
+    chunks: Optional[dict[str, int]] = None,  # Not used currently, for API compatibility
 ) -> None:
-  """Run evaluation using parallel processing with ThreadPoolExecutor.
-
-  Uses threads for parallel I/O-bound zarr reads and metric computation
-  across time chunks. Each thread uses the synchronous dask scheduler
-  to avoid nested scheduler conflicts.
-
-  Will save a separate results NetCDF file for each config.Eval.
-
+  """Run evaluation in parallel in memory.
+  
+  Use concurrent.futures to parallelize the evaluation of different metrics and regions.
+  
   Args:
     data_config: config.Data instance.
     eval_configs: Dictionary of config.Eval instances.
     skipna: Whether to skip NaN values in both forecasts and observations.
     n_workers: Number of parallel workers. Defaults to number of CPUs.
-    chunks: Chunk sizes for parallelization, e.g. {'init_time': 10}.
-      If None, defaults to chunking along init_time/time with size 1.
+    chunks: Currently unused, kept for API compatibility.
   """
-  import os
-  
-  if n_workers is None:
-    n_workers = os.cpu_count() or 4
-  
-  logging.info(f'Using {n_workers} workers for parallel evaluation')
-
   for eval_name, eval_config in eval_configs.items():
-    logging.info(f'Evaluating {eval_name}')
-    _evaluate_with_parallel_single(
-        eval_name, eval_config, data_config, skipna, chunks, n_workers
-    )
-
-
-def _evaluate_with_parallel_single(
-    eval_name: str,
-    eval_config: config.Eval,
-    data_config: config.Data,
-    skipna: bool,
-    chunks: Optional[dict[str, int]],
-    n_workers: int,
-) -> None:
-  """Evaluate metrics for a single eval config using parallel processing."""
+    _evaluate_all_metrics(eval_name, eval_config, data_config, skipna=skipna, parallel=True, n_workers=n_workers)
   
-  # Open datasets (with dask for lazy loading)
-  forecast, truth, climatology = open_forecast_and_truth_datasets(
-      data_config, eval_config, use_dask=True
-  )
-
-  time_dim = 'init_time' if data_config.by_init else 'time'
-  
-  # Default chunking
-  if chunks is None:
-    chunks = {time_dim: 1}
-  
-  # Handle special forecast types
-  if eval_config.evaluate_climatology:
-    valid_time_dim = 'valid_time' if data_config.by_init else 'time'
-    forecast = climatology[list(forecast.keys())].sel(
-        dayofyear=forecast[valid_time_dim].dt.dayofyear,
-        hour=forecast[valid_time_dim].dt.hour,
-    )
-    
-  if eval_config.evaluate_probabilistic_climatology:
-    probabilistic_climatology = utils.make_probabilistic_climatology(
-        truth,
-        eval_config.probabilistic_climatology_start_year,
-        eval_config.probabilistic_climatology_end_year,
-        eval_config.probabilistic_climatology_hour_interval,
-    )
-    valid_time_dim = 'valid_time' if data_config.by_init else 'time'
-    forecast = probabilistic_climatology[list(forecast.keys())].sel(
-        dayofyear=forecast[valid_time_dim].dt.dayofyear,
-        hour=forecast[valid_time_dim].dt.hour,
-    )
-
-  if eval_config.evaluate_persistence:
-    forecast = create_persistence_forecast(forecast, truth)
-  
-  # Get time coordinate values for iteration
-  time_coords = forecast[time_dim].values
-  chunk_size = chunks.get(time_dim, 1)
-  time_chunks = [
-      time_coords[i:i + chunk_size] 
-      for i in range(0, len(time_coords), chunk_size)
-  ]
-  
-  logging.info(f'Processing {len(time_chunks)} chunks with {n_workers} workers')
-  
-  def process_chunk(time_slice):
-    """Process a single time chunk using synchronous dask scheduler."""
-    with dask.config.set(scheduler='synchronous'):
-      forecast_chunk = forecast.sel({time_dim: time_slice}).compute()
-      
-      if data_config.by_init:
-        truth_chunk = truth.sel(time=forecast_chunk.valid_time).compute()
-      else:
-        truth_chunk = truth.sel(time=time_slice).compute()
-      
-      return _metric_and_region_loop(
-          forecast_chunk,
-          truth_chunk,
-          eval_config,
-          skipna=skipna,
-          compute_chunk=True,
-      )
-  
-  # Use ThreadPoolExecutor (shares memory, avoids pickling issues)
-  results = []
-  with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-    futures = {executor.submit(process_chunk, tc): i for i, tc in enumerate(time_chunks)}
-    
-    for future in tqdm(
-        concurrent.futures.as_completed(futures),
-        total=len(futures),
-        desc=f'Evaluating {eval_name}',
-    ):
-      try:
-        result = future.result()
-        results.append((futures[future], result))
-      except Exception as e:
-        logging.error(f'Chunk processing failed: {e}')
-        raise
-  
-  # Sort results by original order
-  results.sort(key=lambda x: x[0])
-  results = [r[1] for r in results]
-
-  # Combine results along time dimension and compute temporal mean
-  combined = xr.concat(results, dim=time_dim)
-  if eval_config.temporal_mean:
-    combined = combined.mean(dim=time_dim, skipna=skipna)
-
-  logging.info(f'Evaluation complete:\n{combined}')
-
-  output_path = _get_output_path(data_config, eval_name, 'netcdf')
-  _to_netcdf(combined, output_path)
-  logging.info(f'Saved results to {output_path}')
 
 
 @dataclasses.dataclass

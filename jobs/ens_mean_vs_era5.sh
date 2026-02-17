@@ -39,7 +39,7 @@ python scripts/evaluate.py \
     --obs_path=gs://weatherbench2/datasets/era5/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr \
     --climatology_path=gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_240x121_equiangular_with_poles_conservative.zarr \
     --output_dir=./result \
-    --input_chunks=time=1,lead_time=1 \
+    --input_chunks=init_time=1,lead_time=1 \
     --eval_configs=deterministic \
     --use_beam=True \
     --runner=DirectRunner

@@ -39,7 +39,7 @@ python scripts/evaluate.py \
 	--obs_path=gs://weatherbench2/datasets/era5/1959-2022-6h-240x121_equiangular_with_poles_conservative.zarr \
 	--climatology_path=gs://weatherbench2/datasets/era5-hourly-climatology/1990-2017_6h_240x121_equiangular_with_poles_conservative.zarr \
 	--by_init=True \
-	--regions=all \
+	--regions=global,tropics,extra-tropics,northern-hemisphere,southern-hemisphere,europe,arctic,antarctic,mediterranean \
 	--eval_configs=probabilistic,ensemble_binary,probabilistic_spatial,ensemble_binary_spatial,probabilistic_spatial_histograms \
 	--time_start=2020-01-01T06:00:00 \
 	--time_stop=2020-01-10T00:00:00 \

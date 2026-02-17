@@ -41,8 +41,8 @@ python scripts/evaluate.py \
     --by_init=True \
     --regions=all \
     --eval_configs=probabilistic,ensemble_binary,probabilistic_spatial,ensemble_binary_spatial,probabilistic_spatial_histograms \
-    --time_start=2020-01-01T06:00:00Z \
-    --time_stop=2022-01-10T00:00:00Z \
+    --time_start=2020-01-01T06:00:00 \
+    --time_stop=2022-01-10T00:00:00 \
     --output_file_prefix=ens_vs_era5 \
     --output_dir=./result \
     --input_chunks=init_time=1,lead_time=1 \
